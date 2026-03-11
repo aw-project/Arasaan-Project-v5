@@ -1,0 +1,316 @@
+name: Hybrid Build Android from ZIP (Flutter + Native)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip rsync
+
+      - name: Find newest ZIP in repo root
+        id: findzip
+        shell: bash
+        run: |
+          set -e
+
+          ZIP_FILE=$(find . -maxdepth 1 -type f -name "*.zip" -printf "%T@ %p\n" | sort -nr | head -n 1 | cut -d' ' -f2-)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "❌ Tidak ditemukan file ZIP di root repo."
+            exit 1
+          fi
+
+          ZIP_BASENAME=$(basename "$ZIP_FILE")
+          ZIP_NAME="${ZIP_BASENAME%.zip}"
+
+          echo "✅ ZIP ditemukan: $ZIP_FILE"
+          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          set -e
+          rm -rf extracted project_root
+          mkdir -p extracted project_root
+          unzip -o "${{ steps.findzip.outputs.zip_file }}" -d extracted
+
+      - name: Inspect extracted files
+        shell: bash
+        run: |
+          echo "=== Extracted tree (maxdepth 4) ==="
+          find extracted -maxdepth 4 | sed 's#^#- #'
+
+      - name: Detect project type and root
+        id: detect
+        shell: bash
+        run: |
+          set -e
+
+          PROJECT_TYPE=""
+          PROJECT_DIR=""
+
+          echo "Mendeteksi Flutter project..."
+          FLUTTER_DIR=$(find extracted -type f -name "pubspec.yaml" | while read -r file; do
+            dir=$(dirname "$file")
+            if [ -d "$dir/lib" ]; then
+              echo "$dir"
+              break
+            fi
+          done)
+
+          if [ -n "$FLUTTER_DIR" ]; then
+            PROJECT_TYPE="flutter"
+            PROJECT_DIR="$FLUTTER_DIR"
+          else
+            echo "Flutter project tidak ditemukan, cek Android native..."
+            ANDROID_DIR=$(find extracted -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) | while read -r file; do
+              dir=$(dirname "$file")
+              if [ -d "$dir/app" ]; then
+                echo "$dir"
+                break
+              fi
+            done)
+
+            if [ -n "$ANDROID_DIR" ]; then
+              PROJECT_TYPE="android"
+              PROJECT_DIR="$ANDROID_DIR"
+            fi
+          fi
+
+          if [ -z "$PROJECT_TYPE" ] || [ -z "$PROJECT_DIR" ]; then
+            echo "❌ Gagal mendeteksi project Flutter maupun Android native."
+            exit 1
+          fi
+
+          echo "✅ Project type : $PROJECT_TYPE"
+          echo "✅ Project root : $PROJECT_DIR"
+
+          echo "project_type=$PROJECT_TYPE" >> "$GITHUB_OUTPUT"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Copy project into isolated build folder
+        shell: bash
+        run: |
+          set -e
+          rsync -a "${{ steps.detect.outputs.project_dir }}/" project_root/
+
+      - name: Verify copied project
+        shell: bash
+        run: |
+          set -e
+          echo "=== project_root tree (maxdepth 3) ==="
+          find project_root -maxdepth 3 | sed 's#^#- #'
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        if: steps.detect.outputs.project_type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Gradle
+        if: steps.detect.outputs.project_type == 'android'
+        uses: gradle/actions/setup-gradle@v4
+
+      # =========================
+      # FLUTTER BUILD SECTION
+      # =========================
+      - name: Ensure Android folder exists (Flutter only)
+        if: steps.detect.outputs.project_type == 'flutter'
+        working-directory: project_root
+        shell: bash
+        run: |
+          set -e
+          if [ ! -d "android" ]; then
+            echo "android/ tidak ada, generate via flutter create ."
+            flutter create .
+          else
+            echo "android/ sudah ada ✅"
+          fi
+
+      - name: Remove default widget test if generated
+        if: steps.detect.outputs.project_type == 'flutter'
+        working-directory: project_root
+        shell: bash
+        run: rm -f test/widget_test.dart
+
+      - name: Flutter doctor
+        if: steps.detect.outputs.project_type == 'flutter'
+        working-directory: project_root
+        run: flutter doctor -v
+
+      - name: Flutter clean
+        if: steps.detect.outputs.project_type == 'flutter'
+        working-directory: project_root
+        run: flutter clean
+
+      - name: Flutter pub get
+        if: steps.detect.outputs.project_type == 'flutter'
+        working-directory: project_root
+        run: flutter pub get
+
+      - name: Flutter analyze
+        if: steps.detect.outputs.project_type == 'flutter'
+        working-directory: project_root
+        continue-on-error: true
+        run: flutter analyze
+
+      - name: Flutter test
+        if: steps.detect.outputs.project_type == 'flutter'
+        working-directory: project_root
+        continue-on-error: true
+        run: flutter test
+
+      - name: Build Flutter Debug APK
+        if: steps.detect.outputs.project_type == 'flutter'
+        working-directory: project_root
+        run: flutter build apk --debug
+
+      - name: Build Flutter Release APK
+        if: steps.detect.outputs.project_type == 'flutter'
+        working-directory: project_root
+        run: flutter build apk --release
+
+      - name: Build Flutter Release AAB
+        if: steps.detect.outputs.project_type == 'flutter'
+        working-directory: project_root
+        run: flutter build appbundle --release
+
+      - name: Collect Flutter outputs
+        if: steps.detect.outputs.project_type == 'flutter'
+        shell: bash
+        run: |
+          set -e
+          mkdir -p out/flutter/debug out/flutter/release out/flutter/aab
+
+          DEBUG_APK="project_root/build/app/outputs/flutter-apk/app-debug.apk"
+          RELEASE_APK="project_root/build/app/outputs/flutter-apk/app-release.apk"
+          RELEASE_AAB="project_root/build/app/outputs/bundle/release/app-release.aab"
+
+          [ -f "$DEBUG_APK" ] && cp "$DEBUG_APK" "out/flutter/debug/${{ steps.findzip.outputs.zip_name }}-debug.apk"
+          [ -f "$RELEASE_APK" ] && cp "$RELEASE_APK" "out/flutter/release/${{ steps.findzip.outputs.zip_name }}-release.apk"
+          [ -f "$RELEASE_AAB" ] && cp "$RELEASE_AAB" "out/flutter/aab/${{ steps.findzip.outputs.zip_name }}-release.aab"
+
+          echo "=== Flutter outputs ==="
+          find out/flutter -type f | sed 's#^#- #'
+
+      - name: Upload Flutter Debug APK
+        if: steps.detect.outputs.project_type == 'flutter'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.findzip.outputs.zip_name }}-debug-apk
+          path: out/flutter/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload Flutter Release APK
+        if: steps.detect.outputs.project_type == 'flutter'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.findzip.outputs.zip_name }}-release-apk
+          path: out/flutter/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload Flutter Release AAB
+        if: steps.detect.outputs.project_type == 'flutter'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.findzip.outputs.zip_name }}-release-aab
+          path: out/flutter/aab/*.aab
+          if-no-files-found: error
+
+      # =========================
+      # ANDROID NATIVE BUILD SECTION
+      # =========================
+      - name: Verify Android native project files
+        if: steps.detect.outputs.project_type == 'android'
+        working-directory: project_root
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -f settings.gradle ] && [ ! -f settings.gradle.kts ]; then
+            echo "❌ settings.gradle(.kts) tidak ditemukan"
+            exit 1
+          fi
+
+          if [ ! -f build.gradle ] && [ ! -f build.gradle.kts ]; then
+            echo "❌ build.gradle(.kts) tidak ditemukan"
+            exit 1
+          fi
+
+          if [ ! -d app ]; then
+            echo "❌ folder app tidak ditemukan"
+            exit 1
+          fi
+
+      - name: Ensure gradlew exists
+        if: steps.detect.outputs.project_type == 'android'
+        working-directory: project_root
+        shell: bash
+        run: |
+          set -e
+          if [ ! -f ./gradlew ]; then
+            echo "gradlew tidak ditemukan, membuat wrapper..."
+            gradle wrapper
+          fi
+          chmod +x ./gradlew
+
+      - name: Build Native Debug APK
+        if: steps.detect.outputs.project_type == 'android'
+        working-directory: project_root
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Build Native Release APK
+        if: steps.detect.outputs.project_type == 'android'
+        working-directory: project_root
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Collect Native outputs
+        if: steps.detect.outputs.project_type == 'android'
+        shell: bash
+        run: |
+          set -e
+          mkdir -p out/native/debug out/native/release
+
+          DEBUG_APK=$(find project_root/app/build/outputs/apk/debug -type f -name "*.apk" | head -n 1 || true)
+          RELEASE_APK=$(find project_root/app/build/outputs/apk/release -type f -name "*.apk" | head -n 1 || true)
+
+          [ -n "$DEBUG_APK" ] && cp "$DEBUG_APK" "out/native/debug/${{ steps.findzip.outputs.zip_name }}-debug.apk"
+          [ -n "$RELEASE_APK" ] && cp "$RELEASE_APK" "out/native/release/${{ steps.findzip.outputs.zip_name }}-release.apk"
+
+          echo "=== Native outputs ==="
+          find out/native -type f | sed 's#^#- #'
+
+      - name: Upload Native Debug APK
+        if: steps.detect.outputs.project_type == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.findzip.outputs.zip_name }}-debug-apk
+          path: out/native/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload Native Release APK
+        if: steps.detect.outputs.project_type == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.findzip.outputs.zip_name }}-release-apk
+          path: out/native/release/*.apk
+          if-no-files-found: error
